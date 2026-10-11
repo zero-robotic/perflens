@@ -1,0 +1,5 @@
+/.deps/
+/build*/
+*.perfetto-trace
+*.perfetto-trace.pbtxt
+__pycache__/

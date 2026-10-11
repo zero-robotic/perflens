@@ -1,0 +1,2 @@
+#pragma once
+inline constexpr const char* kCpuConfigTemplate = R"perflens(@CPU_CONFIG_TEMPLATE@)perflens";

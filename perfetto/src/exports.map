@@ -1,0 +1,1 @@
+PERFLENS_0 { global: pl_trace_*; local: *; };
