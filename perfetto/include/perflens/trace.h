@@ -20,12 +20,13 @@ PL_TRACE_API int pl_trace_init(void);
 PL_TRACE_API int pl_trace_enabled(const char* category);
 
 /* Strings are copied as needed by the SDK; dynamic names are supported.
- * Begin/end must be properly nested on the same OS thread. A zero token means
- * inactive. Pass the original category and returned token to end. Tokens guard
- * against an old scope ending in a later recording session.
+ * Begin/end must be properly nested on the same OS thread and use the same
+ * category. Recording follows Perfetto's native semantics: each call checks
+ * whether tracing is enabled; slices crossing recording boundaries may be
+ * incomplete. Category and name must be non-null for a valid begin.
  */
-PL_TRACE_API uint64_t pl_trace_begin(const char* category, const char* name);
-PL_TRACE_API void pl_trace_end(const char* category, uint64_t token);
+PL_TRACE_API void pl_trace_begin(const char* category, const char* name);
+PL_TRACE_API void pl_trace_end(const char* category);
 PL_TRACE_API void pl_trace_instant(const char* category, const char* name);
 PL_TRACE_API void pl_trace_counter(const char* category, const char* name, int64_t value);
 /* Process-scoped flow IDs connect events across threads. Reuse an ID only after

@@ -112,34 +112,45 @@ sudo perfetto/build/perflens-trace record --duration 10 --dry-run
 
 ## 系统调度与应用埋点联合采集
 
-在业务进程启动前设置 producer socket，并先启动业务程序：
-
-```bash
-export PERFETTO_PRODUCER_SOCK_NAME=/run/perflens/producer
-perfetto/build/perflens-demo --seconds 15
-```
-
-示例最多等待 30 秒，直到采集启用 `demo` category；在另一个终端执行：
+先启动共享服务，然后开始录制。允许业务程序在录制开始后接入，
+这样能够采集主进程及工作线程的创建关系：
 
 ```bash
 sudo perfetto/build/perflens-trace record \
   --tracebox "$PWD/perfetto/.deps/bin/tracebox" \
-  --duration 10 --categories demo \
+  --duration 20 --categories demo \
   --output /tmp/combined.perfetto-trace
 ```
+
+看到 `Tracing active. Applications can now be started.` 后，在另一个终端执行：
+
+```bash
+export PERFETTO_PRODUCER_SOCK_NAME=/run/perflens/producer
+perfetto/build/perflens-demo --seconds 10
+```
+
+已有的长生命周期程序也可以在录制前接入。示例最多等待 30 秒，直到
+采集启用 `demo` category；采集器不会等待应用接入才开始计时。
 
 `--categories` 接受逗号分隔的 category 和通配符，例如
 `--categories 'request,network.*'`。只有匹配的应用事件被启用；系统调度
 仍覆盖全系统。不传此选项则只采集系统事件。
 
-CLI 会检查是否有 `track_event` producer 接入；实际是否产生了指定 category
-的事件，仍应在结果中确认。应用应在采集开始前初始化，并在停止采集前保持运行。
+CLI 检查内核数据源已连接，不要求 `track_event` producer 预先接入；实际是否
+产生了指定 category 的事件，仍应在结果中确认。业务程序应在录制结束前运行。
 短进程退出前可调用 `pl_trace_flush()` 提交当前线程待写数据。
 
 在 UI 中可查看 `Compute`、`Sleep`、`IterationDone`、`demo/iterations`
 以及线程间 Flow，同时在 CPU tracks 查看调度。函数区间长度是总耗时，
 包括子调用、等待调度和休眠；on-CPU 时间需要与该线程的 Running 区间取交集。
 异步任务应在各个线程分别记录执行片段，再通过 Flow 关联。
+
+同一进程的线程依靠系统采集的 TID→TGID 关系归入进程组，不按线程名称合并。
+在 Linux 宿主机初始 PID 命名空间采集时，`linux.process_stats` 提供已有线程的
+归属，`task/task_newtask` 等内核事件补充采集中创建的线程。后者取决于内核支持。
+OrbStack 等嵌套 PID 命名空间可能导致 `/proc` 与内核调度使用不同 ID：先录制再
+启动程序可通过创建事件恢复新进程的调度线程分组，但不能修复已有线程的缺失
+归属，也不能自动关联容器内的 SDK 埋点。完整关联仍需在初始 PID 命名空间采集。
 
 ## 业务代码接入
 
@@ -181,10 +192,11 @@ int main() {
 初始化前设置。返回成功表示 SDK 初始化完成；服务连接与启用采集是异步的。
 单次很短的程序需要用 `pl_trace_enabled("request")` 等待采集启用后再执行。
 
-C 调用者使用 `trace.h` 中的 `pl_trace_begin()` / `pl_trace_end()`；
-begin 返回 token，传给对应的 end。区间必须在同一 OS 线程上按 LIFO 嵌套。
-不支持把同一个 scope 横跨协程挂起后的线程迁移。会话切换后旧 scope 的 end
-会被忽略，跨越采集边界的区间可能不完整。封装每个进程同时支持一个采集会话。
+C 调用者使用 `trace.h` 中的 `pl_trace_begin(category, name)` /
+`pl_trace_end(category)`，两者都不返回值。区间必须在同一 OS 线程上按 LIFO
+嵌套，并使用相同 category。C++ 作用域封装在进入时调用 begin，退出时调用 end。
+两次调用分别按 Perfetto 当时的采集状态记录，不额外管理采集会话。
+不支持把同一个 scope 横跨协程挂起后的线程迁移，跨越采集边界的区间可能不完整。
 
 字符串支持运行期名称；对外 C 接口内部拦截 C++ 异常。动态 category 的代价
 高于原生静态 category，建议使用有限、稳定的 category 名称。当前接口没有

@@ -8,6 +8,7 @@ import os
 import pathlib
 import platform
 import pwd
+import select
 import signal
 import subprocess
 import tempfile
@@ -63,8 +64,21 @@ def main():
             run("service", "start", ok=False)
             run("check")
             run("record", "--duration", "-1", "--output", str(root / "invalid"), ok=False)
-            run("record", "--categories", "demo", "--output", str(root / "no-producer"), ok=False)
-            require(not (root / "no-producer.pbtxt").exists(), "failed preflight must not leave output")
+            # Record before any SDK producer exists, including process/thread
+            # creation rather than depending only on the initial /proc scan.
+            trace = output_dir / "combined.perfetto-trace"
+            recorder = subprocess.Popen([cli, "record", "--duration", "30", "--categories",
+                                         "demo", "--output", str(trace), *common], text=True,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            startup = ""
+            deadline = time.monotonic() + 15
+            while "Tracing active." not in startup:
+                readable = select.select([recorder.stdout], [], [],
+                                         max(0, deadline - time.monotonic()))[0]
+                require(readable, f"recording readiness timed out: {startup}")
+                chunk = os.read(recorder.stdout.fileno(), 4096)
+                require(chunk, f"recording exited before readiness: {startup}")
+                startup += chunk.decode()
             env = dict(os.environ, PERFETTO_PRODUCER_SOCK_NAME=str(runtime / "producer"))
             command = [demo, "--seconds", "5", "--wait-ms", "15000"]
             if app_user:
@@ -72,17 +86,12 @@ def main():
             for _ in range(2):
                 children.append(subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                                                  stderr=subprocess.PIPE, text=True))
-            deadline = time.monotonic() + 10
-            while "track_event" not in run("service", "status").stdout:
-                require(time.monotonic() < deadline, "SDK producer failed to connect")
-                time.sleep(0.1)
-            # Give both producers time to register, even when one appears first.
-            time.sleep(0.3)
-            trace = output_dir / "combined.perfetto-trace"
-            run("record", "--duration", "3", "--categories", "demo", "--output", str(trace))
             for child in children:
                 stdout, stderr = child.communicate(timeout=15)
                 require(child.returncode == 0, f"demo failed: {stdout}\n{stderr}")
+            recorder.send_signal(signal.SIGINT)
+            stdout, stderr = recorder.communicate(timeout=20)
+            require(recorder.returncode == 0, f"recording failed: {startup}{stdout}\n{stderr}")
             values = query(trace, """
                 SELECT
                   (SELECT count(*) FROM sched WHERE dur > 0) AS scheduling,
@@ -99,6 +108,14 @@ def main():
             """)[0]
             require(int(values["scheduling"]) > 0, f"missing CPU scheduling: {values}")
             require(int(values["apps"]) == 2, f"two application processes not visible: {values}")
+            groups = query(trace, """
+                SELECT t.upid,count(DISTINCT t.utid) AS workers FROM slice s
+                JOIN thread_track tt ON tt.id=s.track_id JOIN thread t USING(utid)
+                WHERE s.name='Compute' AND s.dur>0 GROUP BY t.upid
+            """)
+            require(len(groups) == 2 and all(g["upid"] != "[NULL]" and int(g["workers"]) == 2
+                                            for g in groups),
+                    f"workers were not grouped under their application process: {groups}")
             for name in ("instants", "counters", "flows"):
                 require(int(values[name]) > 0, f"missing {name}: {values}")
             require(int(values["excluded"]) == 0, "disabled category leaked into trace")
@@ -138,7 +155,7 @@ def main():
                     "interrupted capture has no scheduling")
             require(int(query(interrupted, "SELECT count(*) AS n FROM slice WHERE category='demo'")[0]["n"]) == 0,
                     "system-only recording unexpectedly enabled application categories")
-            print(f"PASS: system+SDK capture, two processes, category filtering, counters, flows, "
+            print(f"PASS: system+SDK capture, late producers, grouped workers, category filtering, counters, flows, "
                   f"CPU overlap, no data loss, no clobber, graceful SIGINT.\n{values}\nSleep: {sleep}", flush=True)
             if args.output_dir:
                 print(f"Traces: {output_dir}")

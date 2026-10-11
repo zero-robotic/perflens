@@ -15,18 +15,17 @@ class Scope final {
  public:
   Scope(const char* category, const char* name) {
 #ifndef PERFLENS_TRACE_DISABLED
-    // Own the category before emitting the begin, including dynamic strings.
-    if (pl_trace_enabled(category)) {
-      category_ = category;
-      token_ = pl_trace_begin(category_.c_str(), name);
-    }
+    // Keep dynamic categories alive until the corresponding end call, even if
+    // recording is disabled when the scope starts.
+    if (category && name) category_ = category;
+    pl_trace_begin(category_.c_str(), name);
 #else
     (void)category; (void)name;
 #endif
   }
   ~Scope() {
 #ifndef PERFLENS_TRACE_DISABLED
-    if (token_) pl_trace_end(category_.c_str(), token_);
+    pl_trace_end(category_.c_str());
 #endif
   }
   Scope(const Scope&) = delete;
@@ -35,7 +34,6 @@ class Scope final {
   Scope& operator=(Scope&&) = delete;
  private:
   std::string category_;
-  uint64_t token_ = 0;
 };
 }  // namespace perflens::trace
 

@@ -81,6 +81,8 @@ buffer. --categories app,request enables application events as well as schedulin
 Without --categories only system events are collected. Existing files are kept.
 --dry-run validates tracefs and prints the configuration without recording.
 Business processes must set PERFETTO_PRODUCER_SOCK_NAME=DIR/producer before init.
+Applications may connect after recording starts. Wait for "Tracing active" before
+launching them to include process and thread creation events.
 The service normally runs in the background; logs are stored in DIR/service.log.
 Service stop stops only a service managed by this tool; finish recordings first.
 )";
@@ -241,13 +243,10 @@ std::set<std::string> Events() {
 Result Query(const Arguments& args) {
   return Run({args.tracebox, "perfetto", "--query", "--long"});
 }
-void VerifySources(const Result& result, bool need_app) {
+void VerifySources(const Result& result) {
   if (result.code) Fail("cannot query shared traced service:\n" + result.text);
   for (const auto* source : {"linux.ftrace", "linux.process_stats"})
     if (result.text.find(source) == std::string::npos) Fail(std::string("service has no ") + source + " producer");
-  if (need_app && result.text.find("track_event") == std::string::npos)
-    Fail("no application track_event producer is connected; start the instrumented application with "
-         "PERFETTO_PRODUCER_SOCK_NAME set to this service's producer socket");
 }
 void VerifyDirectory(const fs::path& dir, bool create) {
   if (create && mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) SysCheck(false, "create runtime directory");
@@ -403,7 +402,7 @@ int Stop(const Arguments& args) {
 int Record(const Arguments& args) {
   auto config = perflens::cli::MakeConfig(args.config, Events());
   if (args.dry_run) { std::cout << config; return 0; }
-  VerifySources(Query(args), !args.config.categories.empty());
+  VerifySources(Query(args));
   auto output = fs::absolute(args.output);
   if (fs::exists(output) || fs::is_symlink(output)) Fail("output already exists: " + output.string());
   auto config_path = fs::path(output.string() + ".pbtxt");
@@ -412,12 +411,30 @@ int Record(const Arguments& args) {
   WriteAll(config_fd.value, config);
   std::cout << "Recording " << args.config.duration_ms / 1000 << "s; Ctrl-C stops and flushes.\n"
             << "Config: " << config_path << std::endl;
+  int ready_pipe[2];
+  SysCheck(pipe(ready_pipe) == 0, "recording readiness pipe");
+  Fd ready_read(ready_pipe[0]), ready_write(ready_pipe[1]);
+  SysCheck(fcntl(ready_read.value, F_SETFD, FD_CLOEXEC) == 0, "readiness pipe flags");
   pid_t pid = Spawn({args.tracebox, "perfetto", "--txt", "-c", config_path.string(),
-                     "--no-clobber", "-o", output.string()});
+                     "--no-clobber", "-o", output.string(),
+                     "--notify-fd", std::to_string(ready_write.value)});
+  close(ready_write.value); ready_write.value = -1;
   int status = 0;
   bool forwarded = false;
+  bool ready = false;
   auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(args.config.duration_ms) + 30s;
   while (true) {
+    if (!ready && !interrupted) {
+      pollfd event{ready_read.value, POLLIN, 0};
+      if (poll(&event, 1, 0) > 0) {
+        char result = 1;
+        if (read(ready_read.value, &result, 1) != 1 || result != 0) {
+          Terminate(pid); Fail("Perfetto data sources failed to start; output may be partial");
+        }
+        ready = true;
+        std::cout << "Tracing active. Applications can now be started.\n" << std::flush;
+      }
+    }
     auto done = waitpid(pid, &status, WNOHANG);
     if (done == pid) break;
     if (done < 0 && errno != EINTR) { Terminate(pid); Fail("recording wait failed"); }
@@ -451,7 +468,7 @@ int main(int argc, char** argv) {
       std::cout << version.text;
       perflens::cli::MakeConfig(args.config, Events());
       std::cout << "Required scheduling events accessible.\n";
-      VerifySources(Query(args), false);
+      VerifySources(Query(args));
       std::cout << "Shared service and kernel producers ready.\n";
       return 0;
     }
